@@ -40,12 +40,12 @@ let autoTimer = null;
 // ---------- probing ----------
 
 // Resolves with the response time in ms, or null if nothing answered.
-async function probeHost(ip) {
+async function timePort(ip, port = 443, timeout = TIMEOUT_MS) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeout);
   const t0 = performance.now();
   try {
-    await fetch(`https://${ip}/`, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal });
+    await fetch(`https://${ip}:${port}/`, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal });
     return performance.now() - t0;
   } catch {
     return ctrl.signal.aborted ? null : performance.now() - t0;
@@ -54,6 +54,8 @@ async function probeHost(ip) {
   }
 }
 
+const probeHost = (ip) => timePort(ip);
+
 // Probes every address at the same moment (one socket each; Chrome allows ~256),
 // so the pass ends before the OS starts failing lookups in bulk.
 async function probeAll(ips, onResult) {
@@ -61,6 +63,63 @@ async function probeAll(ips, onResult) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- identifying ----------
+// A refused port answers in one round trip. A port with something listening
+// either hangs (the service ignores our TLS hello) or takes extra round trips
+// (a TLS handshake). Comparing against a port that's surely closed tells them
+// apart. Measured on a real network: Macs keep AirPlay (7000) open; routers,
+// access points and printers answer slower on 80/443 because they run a web page.
+// Windows PCs and iPhones drop every connection, so they never show up at all.
+
+const KINDS = {
+  router: { label: 'Router', group: 'Network', icon: '📡', tint: 'blue' },
+  mac: { label: 'Mac or Apple device', group: 'Computers', icon: '💻', tint: 'slate' },
+  web: { label: 'Device with a web page', group: 'Devices with a web page', icon: '🌐', tint: 'teal' },
+  other: { label: 'Phone or smart device', group: 'Phones & smart devices', icon: '📱', tint: 'violet' },
+};
+const KIND_ORDER = ['router', 'mac', 'web', 'other'];
+const CLOSED_PORT = 47123; // nothing listens here; Chrome doesn't block it
+const IDENTIFY_TIMEOUT_MS = 3000;
+const IDENTIFY_CONCURRENCY = 12; // devices at once, ~4 sockets each. Chrome keeps pass 1's abandoned
+// connection attempts alive for a while and they hold most of its ~256 sockets; more
+// than this and requests queue, which makes every timing (and type) wrong.
+
+async function fastest(ip, port, tries = 3) {
+  let best = null;
+  for (let i = 0; i < tries; i++) {
+    const ms = await timePort(ip, port, IDENTIFY_TIMEOUT_MS);
+    if (ms != null && (best == null || ms < best)) best = ms;
+  }
+  return best;
+}
+
+async function identify(d) {
+  if (d.isRouter) return 'router';
+  const [closed, https, http, airplay] = await Promise.all([
+    fastest(d.ip, CLOSED_PORT),
+    fastest(d.ip, 443),
+    fastest(d.ip, 80),
+    timePort(d.ip, 7000, IDENTIFY_TIMEOUT_MS),
+  ]);
+  if (closed == null || closed > 1500) return 'other'; // too sleepy to tell
+  if (airplay == null) return 'mac';
+  const listening = (ms) => ms == null || (ms > closed * 2.5 && ms > closed + 40);
+  if (listening(https) || listening(http)) return 'web';
+  return 'other';
+}
+
+async function identifyAll(list, onDone) {
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const d = list[next++];
+      d.kind = await identify(d);
+      onDone(d);
+    }
+  };
+  await Promise.all(Array.from({ length: IDENTIFY_CONCURRENCY }, worker));
+}
 
 async function findSubnet() {
   const hits = await Promise.all(
@@ -109,6 +168,7 @@ async function scan() {
   } finally {
     scanning = false;
     setBusy(false);
+    render();
   }
 }
 
@@ -165,6 +225,17 @@ async function sweep(subnet) {
     .filter((d) => confirmed.has(d.ip))
     .map((d) => ({ ...d, ms: Math.min(d.ms, confirmed.get(d.ip)), checking: false }));
   store.set('kyw.lastScanAt', Date.now());
+
+  // Pass 3: work out what each device is. Only live devices are probed, so the
+  // OS's failed-address memory doesn't come into play here.
+  let identified = 0;
+  setMeta(`Found ${devices.length} devices. Working out what they are…`);
+  render();
+  await identifyAll(devices, () => {
+    identified++;
+    progress(0.95 + 0.05 * (identified / devices.length));
+    render();
+  });
   $('progress').hidden = true;
 
   for (const d of devices) known.add(d.ip);
@@ -201,79 +272,119 @@ function el(tag, className, text) {
   return node;
 }
 
+const PENDING = { label: 'Checking…', group: 'Found so far', icon: '📶', tint: 'gray' };
+const SHORT = { router: 'Router', mac: 'Mac', web: 'Web device', other: 'Device' };
+const kindOf = (d) => KINDS[d.kind] ?? PENDING;
+const tileName = (d) => nicknames[d.ip] || (d.kind ? SHORT[d.kind] : 'Checking…');
+
 function render() {
   $('deviceCount').textContent = devices.length;
   const q = $('search').value.trim().toLowerCase();
   const visible = devices
-    .filter((d) => !q || d.ip.includes(q) || (nicknames[d.ip] ?? '').toLowerCase().includes(q))
+    .filter((d) => !q || [d.ip, nicknames[d.ip], kindOf(d).label].some((v) => v?.toLowerCase().includes(q)))
     .sort((a, b) => ipToInt(a.ip) - ipToInt(b.ip));
 
-  const list = $('deviceList');
-  list.replaceChildren(...visible.map(deviceRow));
-  if (!visible.length) list.append(el('li', 'empty', scanning ? 'Looking…' : 'No devices found.'));
+  const root = $('groups');
+  if (!visible.length) {
+    root.replaceChildren(el('p', 'empty', scanning ? 'Looking…' : 'No devices found.'));
+    return;
+  }
+  if ($('view').value === 'all') {
+    root.replaceChildren(group(null, visible));
+    return;
+  }
+  const byKind = new Map();
+  for (const d of visible) {
+    const k = d.kind ?? 'pending';
+    byKind.set(k, [...(byKind.get(k) ?? []), d]);
+  }
+  root.replaceChildren(
+    ...[...KIND_ORDER, 'pending']
+      .filter((k) => byKind.has(k))
+      .map((k) => group(KINDS[k] ?? PENDING, byKind.get(k))),
+  );
 }
 
-function deviceRow(d) {
-  const li = el('li', `device${d.isNew ? ' is-new' : ''}${d.checking ? ' checking' : ''}`);
-  li.append(el('div', 'icon', d.isRouter ? '📡' : '📶'));
+const COLLAPSED_TILES = 16; // about two rows on a laptop
+const expanded = new Set(); // group names the user opened with "Show all"
 
-  const info = el('div');
-  const nameRow = el('div', 'name-row');
-  const nick = nicknames[d.ip];
-  const nameBtn = el('button', `name${nick || d.isRouter ? '' : ' unknown'}`,nick || (d.isRouter ? 'Router' : 'Add a nickname'));
-  nameBtn.type = 'button';
-  nameBtn.title = 'Click to set a nickname';
-  nameBtn.onclick = () => editNickname(d, nameBtn);
-  nameRow.append(nameBtn);
-  if (d.isRouter) nameRow.append(el('span', 'tag router', 'Router'));
-  if (d.isNew) nameRow.append(el('span', 'tag new', 'New'));
-  info.append(nameRow);
-  info.append(el('div', 'sub', `Answered in ${Math.round(d.ms)} ms`));
-  li.append(info);
+function group(kind, list) {
+  const section = el('section', 'group');
+  const name = kind?.group ?? 'all';
+  const open = expanded.has(name) || list.length <= COLLAPSED_TILES;
+  const head = el('div', 'group-head');
+  const title = el('h2', null, kind ? kind.group : 'All devices');
+  title.append(el('span', 'group-count', list.length));
+  head.append(title);
+  if (list.length > COLLAPSED_TILES) {
+    const toggle = el('button', 'show-all', open ? 'Show less ▴' : 'Show all ▾');
+    toggle.type = 'button';
+    toggle.onclick = () => {
+      if (expanded.has(name)) expanded.delete(name);
+      else expanded.add(name);
+      render();
+    };
+    head.append(toggle);
+  }
+  section.append(head);
+  const grid = el('ul', 'grid');
+  grid.append(...(open ? list : list.slice(0, COLLAPSED_TILES)).map(tile));
+  section.append(grid);
+  return section;
+}
 
-  const addr = el('div', 'addr');
-  addr.append(el('div', 'ip', d.ip));
-  const open = el('a', 'open', 'Open ↗');
-  open.href = `http://${d.ip}/`;
-  open.target = '_blank';
-  open.rel = 'noopener noreferrer';
-  addr.append(open);
-  li.append(addr);
+function tile(d) {
+  const kind = kindOf(d);
+  const li = el('li');
+  const btn = el('button', `tile${d.checking ? ' checking' : ''}`);
+  btn.type = 'button';
+  btn.title = `${kind.label} · ${d.ip}`;
+  btn.append(el('span', `tile-icon tint-${kind.tint}`, kind.icon));
+  btn.append(el('span', `tile-name${nicknames[d.ip] ? '' : ' muted'}`, tileName(d)));
+  btn.append(el('span', 'tile-ip', d.ip));
+  if (d.isNew) btn.append(el('span', 'badge', 'New'));
+  btn.onclick = () => openDetail(d);
+  li.append(btn);
   return li;
 }
 
-function editNickname(d, btn) {
-  const input = el('input', 'nick-input');
-  input.value = nicknames[d.ip] ?? '';
-  input.placeholder = 'e.g. Mum’s iPhone';
-  input.setAttribute('aria-label', `Nickname for ${d.ip}`);
-  btn.replaceWith(input);
-  input.focus();
-
-  let done = false;
-  const finish = (save) => {
-    if (done) return;
-    done = true;
-    if (save) {
-      const v = input.value.trim();
-      if (v) nicknames[d.ip] = v;
-      else delete nicknames[d.ip];
-      store.set('kyw.nicknames', nicknames);
-    }
-    render();
-  };
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') finish(true);
-    if (e.key === 'Escape') finish(false);
-  });
-  input.addEventListener('blur', () => finish(true));
+function openDetail(d) {
+  const kind = kindOf(d);
+  const dlg = $('detail');
+  $('detailIcon').className = `tile-icon big tint-${kind.tint}`;
+  $('detailIcon').textContent = kind.icon;
+  $('detailTitle').textContent = nicknames[d.ip] || kind.label;
+  $('detailType').textContent = kind.label;
+  $('detailIp').textContent = d.ip;
+  $('detailMs').textContent = `${Math.round(d.ms)} ms`;
+  $('detailSeen').textContent = d.isNew ? 'New since your last scan' : 'Not new';
+  $('detailOpen').href = `http://${d.ip}/`;
+  $('nickInput').value = nicknames[d.ip] ?? '';
+  dlg.dataset.ip = d.ip;
+  dlg.showModal();
 }
+
+$('detailForm').addEventListener('submit', (e) => {
+  // method="dialog" closes the dialog; Save stores the nickname first.
+  if (e.submitter?.value !== 'save') return;
+  const ip = $('detail').dataset.ip;
+  const v = $('nickInput').value.trim();
+  if (v) nicknames[ip] = v;
+  else delete nicknames[ip];
+  store.set('kyw.nicknames', nicknames);
+  render();
+});
+$('detail').addEventListener('click', (e) => {
+  if (e.target === $('detail')) $('detail').close(); // click on the backdrop
+});
 
 // ---------- wiring ----------
 
 $('scanBtn').addEventListener('click', scan);
 $('subnetForm').addEventListener('submit', (e) => { e.preventDefault(); scan(); });
 $('search').addEventListener('input', render);
+$('view').value = store.get('kyw.view', 'type');
+$('view').addEventListener('change', () => { store.set('kyw.view', $('view').value); render(); });
 
 const lastSubnet = store.get('kyw.lastSubnet', null);
 if (lastSubnet) $('subnet').placeholder = lastSubnet;

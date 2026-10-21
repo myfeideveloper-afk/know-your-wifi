@@ -42,10 +42,39 @@
 
     <section id="results" hidden>
       <div class="toolbar">
-        <input id="search" type="search" aria-label="Search devices" placeholder="Search IP or nickname…" autocomplete="off">
+        <input id="search" type="search" aria-label="Search devices" placeholder="Search IP, nickname or type…" autocomplete="off">
+        <label class="view">View:
+          <select id="view">
+            <option value="type">By type</option>
+            <option value="all">By address</option>
+          </select>
+        </label>
       </div>
-      <ul class="devices" id="deviceList"></ul>
+      <div id="groups"></div>
     </section>
+
+    <dialog id="detail" aria-labelledby="detailTitle">
+      <form id="detailForm" method="dialog">
+        <div class="detail-head">
+          <span id="detailIcon" class="tile-icon big"></span>
+          <h2 id="detailTitle"></h2>
+        </div>
+        <dl class="detail-facts">
+          <dt>Type</dt><dd id="detailType"></dd>
+          <dt>Address</dt><dd id="detailIp" class="mono"></dd>
+          <dt>Answered in</dt><dd id="detailMs"></dd>
+          <dt>History</dt><dd id="detailSeen"></dd>
+        </dl>
+        <label class="nick-label" for="nickInput">Nickname</label>
+        <input id="nickInput" class="nick-input" placeholder="e.g. Reception printer" autocomplete="off">
+        <div class="detail-actions">
+          <a id="detailOpen" target="_blank" rel="noopener noreferrer">Open its web page ↗</a>
+          <span class="spacer"></span>
+          <button value="close">Close</button>
+          <button value="save" class="primary small">Save</button>
+        </div>
+      </form>
+    </dialog>
 
     <section class="about">
       <h2>How this works</h2>
@@ -56,8 +85,9 @@
       </p>
       <ul>
         <li><b>Chrome / Edge</b> may ask to <i>“look for and connect to devices on your local network”</i>. Click <b>Allow</b>.</li>
-        <li>Browsers can’t read device names or MAC addresses. Click an address to give it a nickname, or <b>Open</b> to visit its web page (routers, printers, cameras).</li>
-        <li>Devices with a strict firewall (some printers, watches, Windows PCs) stay silent and won’t be counted. Treat the number as a minimum.</li>
+        <li>The type is a best guess from which ports a device keeps open. Macs (AirPlay) and devices with their own web page (routers, printers) can be told apart. Phones and smart-home gadgets look the same, so they share a group.</li>
+        <li>Browsers can’t read device names, MAC addresses or Wi‑Fi network names (SSIDs). Click a device to give it a nickname.</li>
+        <li>Windows PCs, iPhones and watches usually block every connection, so they stay invisible and aren’t counted. Treat the number as a minimum.</li>
         <li>Only scan networks you own or are allowed to scan.</li>
       </ul>
     </section>
