@@ -12,7 +12,10 @@
 // Live devices answer within ~2.1s (measured). Empty addresses are reported
 // unreachable from ~2.2s on (macOS) or ~3s (Windows, Linux), so stay below that.
 const TIMEOUT_MS = 2200;
-const SETTLE_MS = 21_000; // > host_down_time, before the confirm pass and the next scan
+const SETTLE_MS = 21_000; // > host_down_time, before the confirm pass
+// Between scans. Chrome keeps abandoned attempts to unreachable addresses alive
+// for ~70s and they hold its shared connection pool; this lets them drain.
+const COOLDOWN_MS = 45_000;
 const AUTO_SCAN_MS = 180_000;
 
 // Router addresses used by most home and office networks.
@@ -81,9 +84,20 @@ const KINDS = {
 const KIND_ORDER = ['router', 'mac', 'web', 'other'];
 const CLOSED_PORT = 47123; // nothing listens here; Chrome doesn't block it
 const IDENTIFY_TIMEOUT_MS = 3000;
-const IDENTIFY_CONCURRENCY = 12; // devices at once, ~4 sockets each. Chrome keeps pass 1's abandoned
-// connection attempts alive for a while and they hold most of its ~256 sockets; more
-// than this and requests queue, which makes every timing (and type) wrong.
+const IDENTIFY_CONCURRENCY = 12; // devices at once, ~4 sockets each. If requests have
+// to queue in Chrome, the wait is added to the measurement and every type comes out wrong.
+const INCONCLUSIVE = null;
+
+// Waits until a device we know is alive answers promptly again, i.e. Chrome
+// isn't queueing our requests behind earlier, abandoned ones.
+async function waitForFreeConnections(ip, maxWaitMs = 30_000) {
+  const end = Date.now() + maxWaitMs;
+  while (Date.now() < end) {
+    const answers = await Promise.all(Array.from({ length: 8 }, () => timePort(ip, CLOSED_PORT, 1000)));
+    if (answers.filter((ms) => ms != null).length >= 7) return;
+    await sleep(2000);
+  }
+}
 
 async function fastest(ip, port, tries = 3) {
   let best = null;
@@ -102,23 +116,47 @@ async function identify(d) {
     fastest(d.ip, 80),
     timePort(d.ip, 7000, IDENTIFY_TIMEOUT_MS),
   ]);
-  if (closed == null || closed > 1500) return 'other'; // too sleepy to tell
+  // It answered a moment ago, so silence now means it's asleep or our requests
+  // were held up, not that it's a phone. Try again later.
+  if (closed == null || closed > 1500) return INCONCLUSIVE;
   if (airplay == null) return 'mac';
   const listening = (ms) => ms == null || (ms > closed * 2.5 && ms > closed + 40);
   if (listening(https) || listening(http)) return 'web';
   return 'other';
 }
 
-async function identifyAll(list, onDone) {
-  let next = 0;
-  const worker = async () => {
-    while (next < list.length) {
-      const d = list[next++];
-      d.kind = await identify(d);
+// `referenceIp` is a device known to answer (the router, or the fastest device),
+// used to check Chrome isn't holding our requests back before each round.
+async function identifyAll(list, referenceIp, onDone) {
+  const runRound = async (queue) => {
+    await waitForFreeConnections(referenceIp);
+    let next = 0;
+    const worker = async () => {
+      while (next < queue.length) {
+        const d = queue[next++];
+        d.kind = await identify(d);
+        if (d.kind !== INCONCLUSIVE) onDone(d);
+      }
+    };
+    await Promise.all(Array.from({ length: IDENTIFY_CONCURRENCY }, worker));
+  };
+  await runRound(list);
+  const retry = list.filter((d) => d.kind === INCONCLUSIVE);
+  if (retry.length) {
+    await sleep(3000);
+    await runRound(retry);
+  }
+  for (const d of list) {
+    if (d.kind === INCONCLUSIVE) {
+      d.kind = d.previousKind ?? 'other';
+      onDone(d);
+    } else if (d.kind === 'other' && d.previousKind && d.previousKind !== 'other') {
+      // "Mac" and "web page" are positive evidence; "other" is only the lack of it
+      // (a napping Mac skips AirPlay now and then), so keep the earlier answer.
+      d.kind = d.previousKind;
       onDone(d);
     }
-  };
-  await Promise.all(Array.from({ length: IDENTIFY_CONCURRENCY }, worker));
+  }
 }
 
 async function findSubnet() {
@@ -139,14 +177,16 @@ async function scan() {
   hideNotice();
 
   try {
-    const wait = store.get('kyw.lastScanAt', 0) + SETTLE_MS - Date.now();
-    if (wait > 0 && wait <= SETTLE_MS) {
+    const wait = store.get('kyw.lastScanAt', 0) + COOLDOWN_MS - Date.now();
+    if (wait > 0 && wait <= COOLDOWN_MS) {
       for (let s = Math.ceil(wait / 1000); s > 0; s--) {
         setMeta(`Letting the network settle… starting in ${s}s`);
         await sleep(1000);
       }
     }
-    let subnet = $('subnet').value.trim().replace(/\.$/, '');
+    // Auto-detection knocks on routers of other networks, and those unreachable
+    // attempts clog Chrome for ~70s, so detect once and reuse the answer.
+    let subnet = $('subnet').value.trim().replace(/\.$/, '') || store.get('kyw.lastSubnet', '');
     if (!subnet) {
       setMeta('Finding your network…');
       subnet = await findSubnet();
@@ -176,6 +216,8 @@ async function sweep(subnet) {
   const knownKey = `kyw.known.${subnet}`;
   const known = new Set(store.get(knownKey, []));
   const firstScan = known.size === 0;
+  const kindsKey = `kyw.kinds.${subnet}`;
+  const pastKinds = store.get(kindsKey, {}); // ip -> kind from earlier scans
   const started = performance.now();
   const ips = Array.from({ length: 254 }, (_, i) => `${subnet}.${i + 1}`);
 
@@ -191,7 +233,10 @@ async function sweep(subnet) {
   // Pass 1: find candidates.
   await probeAll(ips, (ip, ms) => {
     if (ms == null) return;
-    devices.push({ ip, ms, isRouter: ip === `${subnet}.1`, isNew: !firstScan && !known.has(ip), checking: true });
+    devices.push({
+      ip, ms, isRouter: ip === `${subnet}.1`, isNew: !firstScan && !known.has(ip), checking: true,
+      previousKind: pastKinds[ip],
+    });
     render();
   });
 
@@ -224,22 +269,29 @@ async function sweep(subnet) {
   devices = devices
     .filter((d) => confirmed.has(d.ip))
     .map((d) => ({ ...d, ms: Math.min(d.ms, confirmed.get(d.ip)), checking: false }));
-  store.set('kyw.lastScanAt', Date.now());
 
   // Pass 3: work out what each device is. Only live devices are probed, so the
   // OS's failed-address memory doesn't come into play here.
   let identified = 0;
   setMeta(`Found ${devices.length} devices. Working out what they are…`);
   render();
-  await identifyAll(devices, () => {
-    identified++;
-    progress(0.95 + 0.05 * (identified / devices.length));
-    render();
-  });
+  const reference = devices.find((d) => d.isRouter) ?? [...devices].sort((a, b) => a.ms - b.ms)[0];
+  if (reference) {
+    await identifyAll(devices, reference.ip, () => {
+      identified++;
+      progress(0.95 + 0.05 * (identified / devices.length));
+      render();
+    });
+  }
+  store.set('kyw.lastScanAt', Date.now());
   $('progress').hidden = true;
 
-  for (const d of devices) known.add(d.ip);
+  for (const d of devices) {
+    known.add(d.ip);
+    pastKinds[d.ip] = d.kind;
+  }
   store.set(knownKey, [...known]);
+  store.set(kindsKey, pastKinds);
   store.set('kyw.lastSubnet', subnet);
 
   const secs = ((performance.now() - started) / 1000).toFixed(1);

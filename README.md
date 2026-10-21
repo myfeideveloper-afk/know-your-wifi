@@ -20,9 +20,9 @@ Browsers can't ping or read the network's device list, but a page *can* time a c
    | Devices with a web page | Port 80/443 slower than the closed port | Both printers, plus a few machines that run a web server |
    | Phones & smart devices | Everything else (Android phones and smart plugs look identical) | n/a |
 
-   Identification only probes 12 devices at a time. Chrome keeps the abandoned attempts from step 2 open in the background and they hold most of its ~256 connections; more parallel probes queue up and every timing goes wrong.
+   Identification probes 12 devices at a time, and first checks that a known device (the router) answers promptly. If Chrome is still busy with earlier, abandoned attempts, requests wait in a queue, the wait gets added to every timing, and every type comes out wrong. A device that doesn't answer at all is retried rather than called a phone. "Mac" and "web page" results are remembered per address, because a napping Mac sometimes skips the AirPlay test.
 
-The page shows devices as tiles, grouped by type like the Windows Start menu, or sorted by address. Click a tile for its details, a nickname, and a link to its web page. A scan takes about 40 seconds.
+The page shows devices as tiles, grouped by type like the Windows Start menu, or sorted by address. Click a tile for its details, a nickname, and a link to its web page. A scan takes about 90 seconds, and scans are spaced at least 45 seconds apart. The network is detected once and then reused, because detection tries routers of other networks, and those unreachable attempts clog Chrome for about 70 seconds.
 
 ## Limits
 
