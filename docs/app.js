@@ -1,5 +1,26 @@
-const DEFAULT_AGENT = 'http://127.0.0.1:7878';
-const AUTO_SCAN_MS = 60_000;
+// Browser-only LAN scan. A page can't read ARP tables or send pings, but it can
+// time connection attempts: a live device answers (accepts or refuses) quickly,
+// while an empty address never answers and the attempt times out.
+// We use https:// so no request is blocked as mixed content.
+//
+// The catch: the OS sometimes fails a whole batch of empty addresses at once,
+// and it remembers failed addresses for 20s (macOS host_down_time), failing new
+// connections to them instantly. Both look exactly like a live device answering.
+// So every scan is two passes: knock on everything, wait out that 20s memory,
+// then re-check only the addresses that answered. Empty ones go silent.
+
+// Live devices answer within ~2.1s (measured). Empty addresses are reported
+// unreachable from ~2.2s on (macOS) or ~3s (Windows, Linux), so stay below that.
+const TIMEOUT_MS = 2200;
+const SETTLE_MS = 21_000; // > host_down_time, before the confirm pass and the next scan
+const AUTO_SCAN_MS = 180_000;
+
+// Router addresses used by most home and office networks.
+const COMMON_SUBNETS = [
+  '192.168.1', '192.168.0', '192.168.100', '192.168.2', '192.168.8', '192.168.31', '192.168.50',
+  '192.168.88', '192.168.178', '192.168.10', '192.168.3', '192.168.11', '192.168.254',
+  '10.0.0', '10.0.1', '10.1.1', '10.10.10', '172.16.0', '172.16.1',
+];
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -11,162 +32,166 @@ const store = {
   },
 };
 
-// When the agent serves this page itself, talk to it on the same origin.
-const servedByAgent = ['127.0.0.1', 'localhost'].includes(location.hostname);
-let agentUrl = servedByAgent ? location.origin : store.get('kyw.agent', DEFAULT_AGENT);
-
-const nicknames = store.get('kyw.nicknames', {}); // mac -> nickname
-let known = new Set(store.get('kyw.known', [])); // macs seen in earlier scans
-let lastResult = null;
-let activeFilter = 'all';
+const nicknames = store.get('kyw.nicknames', {}); // "192.168.1.5" -> nickname
+let devices = []; // { ip, ms, isRouter, isNew }
+let scanning = false;
 let autoTimer = null;
 
-// ---------- device type guessing ----------
+// ---------- probing ----------
 
-const TYPES = [
-  { key: 'router', label: 'Network', icon: '📡', match: /unifi|u7|usw|uap|router|gateway|access.?point|mesh|deco|eero|ubiquiti|tp-?link|netgear|mikrotik|aruba|ruckus|linksys|cisco/i },
-  { key: 'phone', label: 'Phone', icon: '📱', match: /iphone|android|galaxy|pixel|redmi|poco|xiaomi.*\d|oppo|vivo|realme|oneplus|huawei|honor|nokia|motorola|z-?fold|z-?flip|\bs2\d\b|\ba\d{2}\b|phone/i },
-  { key: 'tablet', label: 'Tablet', icon: '📲', match: /ipad|tab\b|tablet|kindle/i },
-  { key: 'watch', label: 'Wearable', icon: '⌚', match: /watch/i },
-  { key: 'computer', label: 'Computer', icon: '💻', match: /macbook|imac|mac-?mini|mac-?studio|\bmac\b|laptop|desktop|\bpc\b|thinkpad|nitro|zenbook|asus.?zen|surface|azurewave|intel corporate|liteon|dell|lenovo|wnc corp/i },
-  { key: 'printer', label: 'Printer', icon: '🖨️', match: /print|epson|canon|brother|^brw|^npi|laserjet|officejet/i },
-  { key: 'tv', label: 'TV & media', icon: '📺', match: /\btv\b|roku|chromecast|fire.?stick|bravia|shield|apple.?tv|android.?tv|webos|tizen/i },
-  { key: 'speaker', label: 'Speaker', icon: '🔊', match: /echo|alexa|sonos|homepod|nest|google.?home/i },
-  { key: 'camera', label: 'Camera', icon: '📷', match: /cam|hikvision|dahua|ring|wyze|tapo|reolink|ezviz/i },
-  { key: 'console', label: 'Console', icon: '🎮', match: /playstation|ps[45]|xbox|nintendo|switch/i },
-  { key: 'iot', label: 'Smart home', icon: '💡', match: /tuya|espressif|shelly|sonoff|zhimi|xiaomi|yeelight|philips|hue|smartthings|broadlink|wlan0|esp_|raspberry/i },
-];
-const UNKNOWN = { key: 'other', label: 'Other', icon: '❔' };
-
-function guessType(d) {
-  if (d.isGateway) return TYPES[0];
-  const nameHit = TYPES.find((t) => d.name && t.match.test(d.name));
-  if (nameHit) return nameHit;
-  const vendorHit = TYPES.find((t) => d.vendor && t.match.test(d.vendor));
-  if (vendorHit) return vendorHit;
-  // Randomized MACs are almost always phones, tablets or laptops.
-  return d.randomizedMac ? { ...TYPES[1], label: 'Phone', icon: '📱' } : UNKNOWN;
-}
-
-// ---------- agent connection ----------
-
-function setStatus(state, text) {
-  $('agentStatus').dataset.state = state;
-  $('agentText').textContent = text;
-  $('scanBtn').disabled = state !== 'online';
-  $('setup').hidden = state !== 'offline';
-}
-
-async function checkAgent() {
-  setStatus('checking', 'Looking for scanner…');
+// Resolves with the response time in ms, or null if nothing answered.
+async function probeHost(ip) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const t0 = performance.now();
   try {
-    const res = await fetch(`${agentUrl}/api/health`, { cache: 'no-store' });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? `HTTP ${res.status}`);
-    setStatus('online', 'Scanner connected');
-    return true;
+    await fetch(`https://${ip}/`, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal });
+    return performance.now() - t0;
   } catch {
-    setStatus('offline', 'Scanner not running');
-    return false;
+    return ctrl.signal.aborted ? null : performance.now() - t0;
+  } finally {
+    clearTimeout(timer);
   }
 }
+
+// Probes every address at the same moment (one socket each; Chrome allows ~256),
+// so the pass ends before the OS starts failing lookups in bulk.
+async function probeAll(ips, onResult) {
+  await Promise.all(ips.map(async (ip) => onResult(ip, await probeHost(ip))));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function findSubnet() {
+  const hits = await Promise.all(
+    COMMON_SUBNETS.map(async (s) => ({ s, ms: await probeHost(`${s}.1`) })),
+  );
+  const live = hits.filter((h) => h.ms != null).sort((a, b) => a.ms - b.ms);
+  return live[0]?.s ?? null;
+}
+
+const ipToInt = (ip) => ip.split('.').reduce((n, o) => n * 256 + Number(o), 0);
+const validSubnet = (s) => /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s) && s.split('.').every((o) => +o <= 255);
 
 async function scan() {
-  const btn = $('scanBtn');
-  if (btn.classList.contains('busy')) return;
-  btn.classList.add('busy');
-  btn.disabled = true;
-  btn.querySelector('.btn-label').textContent = 'Scanning…';
-  $('error').hidden = true;
+  if (scanning) return;
+  scanning = true;
+  setBusy(true);
+  hideNotice();
+
   try {
-    const res = await fetch(`${agentUrl}/api/scan`, { cache: 'no-store' });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    handleResult(data);
-  } catch (err) {
-    showError(`Scan failed: ${err.message}`);
-    await checkAgent();
+    const wait = store.get('kyw.lastScanAt', 0) + SETTLE_MS - Date.now();
+    if (wait > 0 && wait <= SETTLE_MS) {
+      for (let s = Math.ceil(wait / 1000); s > 0; s--) {
+        setMeta(`Letting the network settle… starting in ${s}s`);
+        await sleep(1000);
+      }
+    }
+    let subnet = $('subnet').value.trim().replace(/\.$/, '');
+    if (!subnet) {
+      setMeta('Finding your network…');
+      subnet = await findSubnet();
+      if (!subnet) {
+        showNotice(
+          'Couldn’t find your network automatically. If your browser asked for permission to access ' +
+          'local network devices, click <b>Allow</b> and scan again. Otherwise type the first three parts ' +
+          'of your router’s address (for example <code>192.168.1</code>) in the Network box.',
+        );
+        setMeta('No network found.');
+        return;
+      }
+      $('subnet').placeholder = subnet;
+    } else if (!validSubnet(subnet)) {
+      showNotice('Network should look like <code>192.168.1</code>.');
+      return;
+    }
+    await sweep(subnet);
   } finally {
-    btn.classList.remove('busy');
-    btn.disabled = $('agentStatus').dataset.state !== 'online';
-    btn.querySelector('.btn-label').textContent = 'Scan network';
+    scanning = false;
+    setBusy(false);
   }
 }
 
-function showError(msg) {
-  $('error').textContent = msg;
-  $('error').hidden = false;
-}
-
-function handleResult(data) {
-  // The first scan is the baseline; after that, unseen MACs are marked "new".
+async function sweep(subnet) {
+  const knownKey = `kyw.known.${subnet}`;
+  const known = new Set(store.get(knownKey, []));
   const firstScan = known.size === 0;
-  for (const d of data.devices) d.isNew = !firstScan && !known.has(d.mac);
-  for (const d of data.devices) known.add(d.mac);
-  store.set('kyw.known', [...known]);
+  const started = performance.now();
+  const ips = Array.from({ length: 254 }, (_, i) => `${subnet}.${i + 1}`);
 
-  for (const d of data.devices) d.type = guessType(d);
-  lastResult = data;
+  devices = [];
+  $('networkLabel').textContent = `${subnet}.0/24`;
+  $('results').hidden = false;
+  $('progress').hidden = false;
+  const progress = (fraction) => { $('progressBar').style.width = `${fraction * 100}%`; };
+  progress(0);
+  setMeta('Knocking on every address…');
+  render();
+
+  // Pass 1: find candidates.
+  await probeAll(ips, (ip, ms) => {
+    if (ms == null) return;
+    devices.push({ ip, ms, isRouter: ip === `${subnet}.1`, isNew: !firstScan && !known.has(ip), checking: true });
+    render();
+  });
+
+  // If the browser refused every request outright, every address "answers" instantly.
+  if (devices.length > 240 && devices.filter((d) => d.ms < 40).length > 200) {
+    devices = [];
+    store.set('kyw.lastScanAt', Date.now());
+    $('progress').hidden = true;
+    render();
+    showNotice(
+      'Your browser blocked the scan. In Chrome or Edge, click the icon at the left of the address bar, ' +
+      'allow <b>Local network access</b>, then scan again.',
+    );
+    setMeta('Scan blocked by the browser.');
+    return;
+  }
+
+  // Wait out the OS's memory of failed addresses, then pass 2: confirm.
+  const settleEnd = Date.now() + SETTLE_MS;
+  while (Date.now() < settleEnd) {
+    const left = settleEnd - Date.now();
+    progress(0.1 + 0.8 * (1 - left / SETTLE_MS));
+    setMeta(`Found ${devices.length} possible devices. Double-checking in ${Math.ceil(left / 1000)}s…`);
+    await sleep(Math.min(1000, left));
+  }
+  progress(0.95);
+  setMeta(`Double-checking ${devices.length} devices…`);
+  const confirmed = new Map();
+  await probeAll(devices.map((d) => d.ip), (ip, ms) => ms != null && confirmed.set(ip, ms));
+  devices = devices
+    .filter((d) => confirmed.has(d.ip))
+    .map((d) => ({ ...d, ms: Math.min(d.ms, confirmed.get(d.ip)), checking: false }));
+  store.set('kyw.lastScanAt', Date.now());
+  $('progress').hidden = true;
+
+  for (const d of devices) known.add(d.ip);
+  store.set(knownKey, [...known]);
+  store.set('kyw.lastSubnet', subnet);
+
+  const secs = ((performance.now() - started) / 1000).toFixed(1);
+  const newCount = devices.filter((d) => d.isNew).length;
+  const when = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  setMeta(`Scanned at ${when} in ${secs}s` + (newCount ? ` · ${newCount} new` : ''));
   render();
 }
 
 // ---------- rendering ----------
 
-const displayName = (d) => nicknames[d.mac] || d.name;
-
-function render() {
-  const data = lastResult;
-  if (!data) return;
-  const { network } = data;
-
-  $('deviceCount').textContent = data.count;
-  $('networkLabel').textContent = network.cidr;
-  const when = new Date(data.scannedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const newCount = data.devices.filter((d) => d.isNew).length;
-  $('scanMeta').textContent =
-    `Scanned at ${when} in ${(data.durationMs / 1000).toFixed(1)}s via ${network.iface}` +
-    (newCount ? ` · ${newCount} new` : '') +
-    (network.clamped ? ' · large network, showing your /24 only' : '');
-  $('results').hidden = false;
-
-  renderFilters(data.devices);
-
-  const q = $('search').value.trim().toLowerCase();
-  const visible = data.devices.filter((d) => {
-    if (activeFilter !== 'all' && d.type.key !== activeFilter) return false;
-    if (!q) return true;
-    return [displayName(d), d.name, d.ip, d.mac, d.vendor, d.type.label]
-      .some((v) => v && v.toLowerCase().includes(q));
-  });
-
-  const list = $('deviceList');
-  list.replaceChildren(...visible.map(deviceRow));
-  if (!visible.length) {
-    const li = document.createElement('li');
-    li.className = 'empty';
-    li.textContent = 'No devices match.';
-    list.append(li);
-  }
+function setBusy(busy) {
+  const btn = $('scanBtn');
+  btn.classList.toggle('busy', busy);
+  btn.disabled = busy;
+  btn.querySelector('.btn-label').textContent = busy ? 'Scanning…' : 'Scan network';
 }
 
-function renderFilters(devices) {
-  const counts = new Map();
-  for (const d of devices) counts.set(d.type.key, (counts.get(d.type.key) ?? 0) + 1);
-  const types = [...TYPES, UNKNOWN].filter((t) => counts.has(t.key));
-  if (activeFilter !== 'all' && !counts.has(activeFilter)) activeFilter = 'all';
-
-  const chip = (key, label, count) => {
-    const b = document.createElement('button');
-    b.className = 'chip';
-    b.type = 'button';
-    b.setAttribute('aria-pressed', String(activeFilter === key));
-    b.append(label, Object.assign(document.createElement('b'), { textContent: count }));
-    b.onclick = () => { activeFilter = key; render(); };
-    return b;
-  };
-  $('filters').replaceChildren(
-    chip('all', 'All', devices.length),
-    ...types.map((t) => chip(t.key, `${t.icon} ${t.label}`, counts.get(t.key))),
-  );
+const setMeta = (text) => { $('scanMeta').textContent = text; };
+const hideNotice = () => { $('notice').hidden = true; };
+function showNotice(html) {
+  $('notice').innerHTML = html;
+  $('notice').hidden = false;
 }
 
 function el(tag, className, text) {
@@ -176,43 +201,54 @@ function el(tag, className, text) {
   return node;
 }
 
+function render() {
+  $('deviceCount').textContent = devices.length;
+  const q = $('search').value.trim().toLowerCase();
+  const visible = devices
+    .filter((d) => !q || d.ip.includes(q) || (nicknames[d.ip] ?? '').toLowerCase().includes(q))
+    .sort((a, b) => ipToInt(a.ip) - ipToInt(b.ip));
+
+  const list = $('deviceList');
+  list.replaceChildren(...visible.map(deviceRow));
+  if (!visible.length) list.append(el('li', 'empty', scanning ? 'Looking…' : 'No devices found.'));
+}
+
 function deviceRow(d) {
-  const li = el('li', `device${d.isNew ? ' is-new' : ''}`);
-  li.append(el('div', 'icon', d.type.icon));
+  const li = el('li', `device${d.isNew ? ' is-new' : ''}${d.checking ? ' checking' : ''}`);
+  li.append(el('div', 'icon', d.isRouter ? '📡' : '📶'));
 
   const info = el('div');
   const nameRow = el('div', 'name-row');
-  const label = displayName(d);
-  const nameBtn = el('button', `name${label ? '' : ' unknown'}`, label || 'Unknown device');
+  const nick = nicknames[d.ip];
+  const nameBtn = el('button', `name${nick || d.isRouter ? '' : ' unknown'}`,nick || (d.isRouter ? 'Router' : 'Add a nickname'));
   nameBtn.type = 'button';
   nameBtn.title = 'Click to set a nickname';
-  nameBtn.onclick = () => editNickname(d, nameRow, nameBtn);
+  nameBtn.onclick = () => editNickname(d, nameBtn);
   nameRow.append(nameBtn);
-  if (d.isSelf) nameRow.append(el('span', 'tag you', 'This device'));
-  if (d.isGateway) nameRow.append(el('span', 'tag router', 'Router'));
+  if (d.isRouter) nameRow.append(el('span', 'tag router', 'Router'));
   if (d.isNew) nameRow.append(el('span', 'tag new', 'New'));
   info.append(nameRow);
-
-  const vendor = d.vendor ?? (d.randomizedMac ? 'Private MAC' : 'Unknown maker');
-  const sub = [d.type.label, vendor];
-  if (nicknames[d.mac] && d.name) sub.push(`reports as “${d.name}”`);
-  info.append(el('div', 'sub', sub.join(' · ')));
+  info.append(el('div', 'sub', `Answered in ${Math.round(d.ms)} ms`));
   li.append(info);
 
   const addr = el('div', 'addr');
-  addr.append(el('div', 'ip', d.ip), el('div', null, d.mac));
+  addr.append(el('div', 'ip', d.ip));
+  const open = el('a', 'open', 'Open ↗');
+  open.href = `http://${d.ip}/`;
+  open.target = '_blank';
+  open.rel = 'noopener noreferrer';
+  addr.append(open);
   li.append(addr);
   return li;
 }
 
-function editNickname(d, row, btn) {
+function editNickname(d, btn) {
   const input = el('input', 'nick-input');
-  input.value = nicknames[d.mac] ?? d.name ?? '';
-  input.placeholder = d.name ?? 'Nickname';
+  input.value = nicknames[d.ip] ?? '';
+  input.placeholder = 'e.g. Mum’s iPhone';
   input.setAttribute('aria-label', `Nickname for ${d.ip}`);
   btn.replaceWith(input);
   input.focus();
-  input.select();
 
   let done = false;
   const finish = (save) => {
@@ -220,8 +256,8 @@ function editNickname(d, row, btn) {
     done = true;
     if (save) {
       const v = input.value.trim();
-      if (v && v !== d.name) nicknames[d.mac] = v;
-      else delete nicknames[d.mac];
+      if (v) nicknames[d.ip] = v;
+      else delete nicknames[d.ip];
       store.set('kyw.nicknames', nicknames);
     }
     render();
@@ -236,7 +272,11 @@ function editNickname(d, row, btn) {
 // ---------- wiring ----------
 
 $('scanBtn').addEventListener('click', scan);
+$('subnetForm').addEventListener('submit', (e) => { e.preventDefault(); scan(); });
 $('search').addEventListener('input', render);
+
+const lastSubnet = store.get('kyw.lastSubnet', null);
+if (lastSubnet) $('subnet').placeholder = lastSubnet;
 
 $('autoScan').checked = store.get('kyw.auto', false);
 function applyAuto() {
@@ -247,27 +287,5 @@ function applyAuto() {
 $('autoScan').addEventListener('change', applyAuto);
 applyAuto();
 
-$('agentUrl').value = agentUrl;
-$('agentForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  agentUrl = $('agentUrl').value.trim().replace(/\/+$/, '') || DEFAULT_AGENT;
-  store.set('kyw.agent', agentUrl);
-  if (await checkAgent()) scan();
-});
-
-// Keep retrying quietly while the user follows the setup steps.
-async function connectLoop() {
-  if (await checkAgent()) return scan();
-  const retry = setInterval(async () => {
-    if ($('agentStatus').dataset.state === 'online') return clearInterval(retry);
-    try {
-      const res = await fetch(`${agentUrl}/api/health`, { cache: 'no-store' });
-      if (res.ok) {
-        clearInterval(retry);
-        setStatus('online', 'Scanner connected');
-        scan();
-      }
-    } catch {}
-  }, 4000);
-}
-connectLoop();
+// Test hook: ?autoscan starts a scan on load.
+if (new URLSearchParams(location.search).has('autoscan')) scan();

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Know Your WiFi</title>
-  <meta name="description" content="See how many devices are on your network, and what they are.">
+  <meta name="description" content="See how many devices are on your network, right from your browser.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2.4' stroke-linecap='round'><path d='M2 9a15 15 0 0 1 20 0M5.5 12.5a10 10 0 0 1 13 0M9 16a5 5 0 0 1 6 0'/><circle cx='12' cy='19.5' r='1.2' fill='%232563eb'/></svg>">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -14,9 +14,11 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 9a15 15 0 0 1 20 0M5.5 12.5a10 10 0 0 1 13 0M9 16a5 5 0 0 1 6 0"/><circle cx="12" cy="19.5" r="1.2"/></svg>
       <h1>Know Your WiFi</h1>
     </div>
-    <div class="agent-status" id="agentStatus" data-state="checking">
-      <span class="dot"></span><span id="agentText">Looking for scanner…</span>
-    </div>
+    <form class="subnet" id="subnetForm">
+      <label for="subnet">Network</label>
+      <input id="subnet" inputmode="decimal" placeholder="auto" spellcheck="false" autocomplete="off">
+      <span class="suffix">.0/24</span>
+    </form>
   </header>
 
   <main>
@@ -24,52 +26,40 @@
       <div class="count-card">
         <div class="count" id="deviceCount">–</div>
         <div class="count-label">devices on <span id="networkLabel">your network</span></div>
-        <div class="meta" id="scanMeta"></div>
+        <div class="meta" id="scanMeta">Press Scan to look for devices.</div>
       </div>
       <div class="actions">
-        <button id="scanBtn" class="primary" disabled>
+        <button id="scanBtn" class="primary">
           <span class="btn-label">Scan network</span>
           <span class="spinner" aria-hidden="true"></span>
         </button>
-        <label class="auto"><input type="checkbox" id="autoScan"> Rescan every minute</label>
+        <label class="auto"><input type="checkbox" id="autoScan"> Rescan every 3 minutes</label>
       </div>
     </section>
 
-    <section id="setup" class="setup" hidden>
-      <h2>Start the scanner on this computer</h2>
-      <p>
-        Browsers can’t see other devices on your network by themselves. A small scanner runs on your computer,
-        and this page shows what it finds. You need <a href="https://nodejs.org" target="_blank" rel="noopener">Node.js 18+</a>.
-      </p>
-      <pre><code>git clone https://github.com/myfeideveloper-afk/know-your-wifi.git
-cd know-your-wifi/agent
-npm start</code></pre>
-      <p class="hint">
-        When it says “agent running”, this page connects automatically. Chrome may ask to allow access to
-        local network devices. Click <b>Allow</b>.
-        On Safari, open <a href="http://127.0.0.1:7878">http://127.0.0.1:7878</a> instead.
-      </p>
-      <details>
-        <summary>Scanner on a different port?</summary>
-        <form id="agentForm" class="agent-form">
-          <input id="agentUrl" type="url" placeholder="http://127.0.0.1:7878" spellcheck="false">
-          <button type="submit">Connect</button>
-        </form>
-      </details>
-    </section>
-
-    <div id="error" class="error" hidden></div>
+    <div class="progress" id="progress" hidden><div class="bar" id="progressBar"></div></div>
+    <div id="notice" class="notice" hidden></div>
 
     <section id="results" hidden>
       <div class="toolbar">
-        <input id="search" type="search" placeholder="Search name, IP, MAC, vendor…" autocomplete="off">
-        <div class="chips" id="filters" role="group" aria-label="Filter by type"></div>
+        <input id="search" type="search" aria-label="Search devices" placeholder="Search IP or nickname…" autocomplete="off">
       </div>
       <ul class="devices" id="deviceList"></ul>
-      <p class="footnote">
-        <b>Private MAC</b> means the device (usually a phone, tablet or laptop) uses a randomized address, so its
-        maker can’t be identified. Click a device name to give it a nickname. Nicknames stay in this browser.
+    </section>
+
+    <section class="about">
+      <h2>How this works</h2>
+      <p>
+        Your browser tries to connect to every address on your network. Devices that are switched on answer
+        within about a second, and empty addresses don’t answer at all. It then waits about 20 seconds and checks again,
+        because computers sometimes give a false “answer” for empty addresses. Nothing is installed and nothing leaves your network.
       </p>
+      <ul>
+        <li><b>Chrome / Edge</b> may ask to <i>“look for and connect to devices on your local network”</i>. Click <b>Allow</b>.</li>
+        <li>Browsers can’t read device names or MAC addresses. Click an address to give it a nickname, or <b>Open</b> to visit its web page (routers, printers, cameras).</li>
+        <li>Devices with a strict firewall (some printers, watches, Windows PCs) stay silent and won’t be counted. Treat the number as a minimum.</li>
+        <li>Only scan networks you own or are allowed to scan.</li>
+      </ul>
     </section>
   </main>
 
