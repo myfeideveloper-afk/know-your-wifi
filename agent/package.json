@@ -1,0 +1,14 @@
+{
+  "name": "know-your-wifi-agent",
+  "version": "1.0.0",
+  "description": "Local scanner that lists devices on your network for the Know Your WiFi web page",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "scan": "node cli.js"
+  }
+}
